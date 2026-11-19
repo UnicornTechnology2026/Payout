@@ -4,13 +4,15 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch index.js",
-    "start": "node index.js"
+    "start": "node index.js",
+    "coupons:generate": "node scripts/generate-coupons.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "qrcode": "^1.5.4",
     "scratch-cashback-platform": "file:.."
   }
 }

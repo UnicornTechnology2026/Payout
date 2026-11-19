@@ -1,773 +1,344 @@
 import { useEffect, useRef, useState } from "react";
-import {
-  Wallet,
-  Sparkles,
-  ShieldCheck,
-  Gift,
-  ArrowUpRight,
-  RotateCcw,
-  CheckCircle2,
-  History,
-  Smartphone,
-  CircleHelp,
-  LoaderCircle,
-  Banknote,
-} from "lucide-react";
+import { CheckCircle2, CircleAlert, LoaderCircle, ShieldCheck, Smartphone, QrCode, BadgeIndianRupee } from "lucide-react";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:4000";
 
 const money = (n) =>
-  new Intl.NumberFormat("en-IN", {
-    style: "currency",
-    currency: "INR",
-    maximumFractionDigits: 0,
-  }).format(n || 0);
+  new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(n || 0);
 
-function ScratchSurface({ onReveal, disabled }) {
-  const canvasRef = useRef(null);
-  const drawing = useRef(false);
-  const revealed = useRef(false);
-  const last = useRef(null);
-  const [progress, setProgress] = useState(0);
+const cleanCode = (v) => v.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8);
+const prettyCode = (v) => (v.length > 4 ? `${v.slice(0, 4)}-${v.slice(4)}` : v);
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+async function api(path, options = {}) {
+  const res = await fetch(`${API}${path}`, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  let data = {};
+  try {
+    data = await res.json();
+  } catch {
+    /* empty body */
+  }
+  if (!res.ok && res.status !== 202) {
+    const err = new Error(data.error || data.message || "Something went wrong. Please try again.");
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
 
-    const rect = canvas.getBoundingClientRect();
-    const dpr = Math.max(1, window.devicePixelRatio || 1);
-
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-
-    const ctx = canvas.getContext("2d");
-    ctx.scale(dpr, dpr);
-
-    const grad = ctx.createLinearGradient(0, 0, rect.width, rect.height);
-    grad.addColorStop(0, "#c9a96a");
-    grad.addColorStop(0.5, "#ead7a7");
-    grad.addColorStop(1, "#a78345");
-
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, rect.width, rect.height);
-
-    ctx.fillStyle = "rgba(22,37,31,.10)";
-
-    for (let i = 0; i < 26; i++) {
-      ctx.beginPath();
-      ctx.arc(
-        (i * 71) % rect.width,
-        (i * 43) % rect.height,
-        1.2,
-        0,
-        Math.PI * 2,
-      );
-      ctx.fill();
-    }
-
-    ctx.globalCompositeOperation = "source-over";
-    ctx.textAlign = "center";
-    ctx.fillStyle = "#1b2c24";
-
-    ctx.font = "600 13px Arial";
-    ctx.fillText("YOUR REWARD IS INSIDE", rect.width / 2, rect.height / 2 - 7);
-
-    ctx.font = "11px Arial";
-    ctx.fillText("RUB HERE TO REVEAL", rect.width / 2, rect.height / 2 + 17);
-
-    ctx.font = "22px Arial";
-    ctx.fillText("✦", rect.width / 2, 42);
-
-    revealed.current = false;
-    setProgress(0);
-  }, []);
-
-  const point = (e) => {
-    const rect = canvasRef.current.getBoundingClientRect();
-
-    return {
-      x: e.clientX - rect.left,
-      y: e.clientY - rect.top,
-    };
-  };
-
-  const scratch = (e) => {
-    if (disabled || revealed.current) return;
-
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-    const p = point(e);
-
-    ctx.globalCompositeOperation = "destination-out";
-    ctx.lineWidth = 30;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-
-    if (last.current) {
-      ctx.beginPath();
-      ctx.moveTo(last.current.x, last.current.y);
-      ctx.lineTo(p.x, p.y);
-      ctx.stroke();
-    } else {
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, 15, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    last.current = p;
-
-    if (Math.random() < 0.14) {
-      const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-
-      let clear = 0;
-
-      for (let i = 3; i < pixels.length; i += 4) {
-        if (pixels[i] < 30) clear++;
-      }
-
-      const pct = Math.min(
-        100,
-        Math.round((clear / (pixels.length / 4)) * 100),
-      );
-
-      setProgress(pct);
-
-      if (pct > 43 && !revealed.current) {
-        revealed.current = true;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        onReveal();
-      }
-    }
-  };
-
+/* Crown cap drawn as SVG: 21 teeth around a flat top. */
+function Cap({ children, tone = "steel", spin = false }) {
+  const teeth = 21;
+  const pts = [];
+  for (let i = 0; i < teeth * 2; i++) {
+    const a = (Math.PI * 2 * i) / (teeth * 2) - Math.PI / 2;
+    const r = i % 2 === 0 ? 98 : 88;
+    pts.push(`${(100 + r * Math.cos(a)).toFixed(2)},${(100 + r * Math.sin(a)).toFixed(2)}`);
+  }
   return (
-    <div className="scratch-wrap">
-      <div className="scratch-under">
-        <span className="tiny-label">LUCKY REWARD</span>
-        <strong>?</strong>
-        <span>Scratch to reveal</span>
-      </div>
-
-      <canvas
-        ref={canvasRef}
-        className={`scratch-canvas ${disabled ? "is-disabled" : ""}`}
-        onPointerDown={(e) => {
-          if (disabled) return;
-
-          drawing.current = true;
-          last.current = null;
-
-          e.currentTarget.setPointerCapture(e.pointerId);
-          scratch(e);
-        }}
-        onPointerMove={(e) => {
-          if (drawing.current) scratch(e);
-        }}
-        onPointerUp={() => {
-          drawing.current = false;
-          last.current = null;
-        }}
-        onPointerCancel={() => {
-          drawing.current = false;
-          last.current = null;
-        }}
-      />
-
-      <div className="scratch-hint">
-        {progress > 0
-          ? `${progress}% revealed`
-          : "Use your finger or mouse to scratch"}
-      </div>
+    <div className={`cap cap-${tone} ${spin ? "cap-spin" : ""}`}>
+      <svg viewBox="0 0 200 200" aria-hidden="true">
+        <polygon points={pts.join(" ")} className="cap-edge" />
+        <circle cx="100" cy="100" r="76" className="cap-face" />
+        <circle cx="100" cy="100" r="76" className="cap-rim" />
+      </svg>
+      <div className="cap-content">{children}</div>
     </div>
   );
 }
 
-export default function App() {
-  const savedPhone = localStorage.getItem("scratch_phone") || "";
+function Steps({ current }) {
+  const items = ["Enter code", "Your details", "Get cashback"];
+  return (
+    <ol className="steps" aria-label="Progress">
+      {items.map((label, i) => (
+        <li key={label} className={i < current ? "done" : i === current ? "now" : ""} aria-current={i === current ? "step" : undefined}>
+          <span className="dot">{i < current ? "✓" : i + 1}</span>
+          {label}
+        </li>
+      ))}
+    </ol>
+  );
+}
 
-  const [phone, setPhone] = useState(savedPhone);
-  const [activePhone, setActivePhone] = useState(savedPhone);
-  const [card, setCard] = useState(null);
-  const [wallet, setWallet] = useState({
-    balance: 0,
-    history: [],
-  });
-  const [prize, setPrize] = useState(null);
-  const [upiId, setUpiId] = useState("");
-  const [payout, setPayout] = useState(null);
+export default function App() {
+  const params = new URLSearchParams(window.location.search);
+  const urlCode = cleanCode(params.get("code") || "");
+
+  const [demo, setDemo] = useState(false);
+  const [stage, setStage] = useState("code"); // code | form | result
+  const [code, setCode] = useState(urlCode);
+  const [name, setName] = useState("");
+  const [phone, setPhone] = useState("");
+  const [upi, setUpi] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [toast, setToast] = useState("");
-
-  // API REQUEST
-  async function request(path, options = {}) {
-    const res = await fetch(`${API}${path}`, {
-      headers: {
-        "Content-Type": "application/json",
-      },
-      ...options,
-    });
-
-    let data = {};
-
-    try {
-      data = await res.json();
-    } catch {
-      data = {};
-    }
-
-    if (!res.ok) {
-      throw new Error(data.error || data.message || "Something went wrong.");
-    }
-
-    return data;
-  }
-
-  // REFRESH WALLET
-  async function refreshWallet(number = activePhone) {
-    if (!number) return;
-
-    const data = await request(`/api/wallet/${number}`);
-    setWallet(data);
-  }
+  const [result, setResult] = useState(null); // {status, amount, transferId, utr, message, demo}
+  const polls = useRef(0);
 
   useEffect(() => {
-    if (activePhone) {
-      refreshWallet(activePhone).catch((e) => setError(e.message));
-    }
+    api("/api/config").then((c) => setDemo(!!c.demo)).catch(() => {});
+  }, []);
 
-    // Initial wallet load when active mobile number changes.
+  // Opened from a QR scan: verify the code straight away.
+  useEffect(() => {
+    if (urlCode.length === 8) verify(urlCode);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePhone]);
+  }, []);
 
-  // CREATE NEW SCRATCH CARD
-  async function start() {
+  async function verify(value = code) {
     setError("");
-    setToast("");
-    setPrize(null);
-    setPayout(null);
-    setUpiId("");
-    setCard(null);
-
-    if (!/^\d{10}$/.test(phone)) {
-      setError("Please enter a valid 10-digit mobile number.");
+    if (value.length !== 8) {
+      setError("The code has 8 letters and numbers. Check the one under the cap.");
       return;
     }
-
     setBusy(true);
-
     try {
-      localStorage.setItem("scratch_phone", phone);
-      setActivePhone(phone);
-
-      const data = await request("/api/cards/new", {
-        method: "POST",
-        body: JSON.stringify({ phone }),
-      });
-
-      setCard(data.cardId);
-
-      await refreshWallet(phone);
+      await api(`/api/coupons/${value}`);
+      setCode(value);
+      setStage("form");
     } catch (e) {
       setError(e.message);
+      setStage("code");
     } finally {
       setBusy(false);
     }
   }
 
-  // REVEAL SCRATCH CARD PRIZE
-  async function reveal() {
-    if (!card || !activePhone || busy || prize !== null) return;
-
-    setBusy(true);
-    setError("");
-
-    try {
-      const data = await request(`/api/cards/${card}/reveal`, {
-        method: "POST",
-        body: JSON.stringify({
-          phone: activePhone,
-        }),
-      });
-
-      setPrize(data.prize);
-
-      setToast("Prize revealed. Enter your UPI ID to request cashback.");
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  // REQUEST UPI CASHBACK
-  async function requestPayout(e) {
+  async function redeem(e) {
     e.preventDefault();
-
     setError("");
-    setToast("");
 
-    const cleanUpi = upiId.trim();
-
-    if (
-      !cleanUpi ||
-      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}@[A-Za-z0-9.-]{2,50}$/.test(cleanUpi)
-    ) {
-      setError("Please enter a valid UPI ID, for example name@upi.");
-      return;
-    }
-
-    if (!card || !activePhone || prize === null) {
-      setError("Please reveal your scratch-card prize first.");
-      return;
-    }
+    if (!/^[\p{L}][\p{L} .'-]{1,59}$/u.test(name.trim())) return setError("Enter your full name.");
+    if (!/^[6-9]\d{9}$/.test(phone)) return setError("Enter a valid 10-digit mobile number.");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}@[A-Za-z0-9.-]{2,50}$/.test(upi.trim()))
+      return setError("Enter a valid UPI ID, for example name@upi.");
 
     setBusy(true);
-
     try {
-      const data = await request("/api/payouts/upi", {
+      const data = await api("/api/redeem", {
         method: "POST",
-        body: JSON.stringify({
-          phone: activePhone,
-          cardId: card,
-          upiId: cleanUpi,
-        }),
+        body: JSON.stringify({ code, name: name.trim(), phone, upiId: upi.trim() }),
       });
-
-      setPayout({
-        status: data.status || "PENDING",
-        transferId: data.transferId,
-        message: data.message || "Payout request received.",
-      });
-
-      setToast(
-        data.status === "SUCCESS"
-          ? "Cashfree confirmed your cashback payment."
-          : "Your payout request is being processed.",
-      );
-
-      if (data.status === "SUCCESS") {
-        await refreshWallet(activePhone);
-      }
+      polls.current = 0;
+      setResult(data);
+      setStage("result");
     } catch (e) {
-      // No false success message when payouts are disabled.
       setError(e.message);
+      // Code was taken by someone else while the form was open.
+      if (e.status === 409 || e.status === 404) setStage("code");
     } finally {
       setBusy(false);
     }
   }
 
-  // CHECK PAYOUT STATUS
-  async function checkPayoutStatus() {
-    if (!payout?.transferId) return;
-
-    setBusy(true);
-    setError("");
-
+  async function checkStatus() {
+    if (!result?.transferId) return;
     try {
-      const data = await request(
-        `/api/payouts/${encodeURIComponent(payout.transferId)}/status`,
-      );
-
-      setPayout((current) => ({
-        ...current,
-        status: data.status,
-        message: data.message,
-        utr: data.utr,
-      }));
-
-      if (data.status === "SUCCESS") {
-        setToast("Cashfree confirmed your cashback payment.");
-
-        await refreshWallet(activePhone);
-      } else if (data.status === "FAILED") {
-        setToast("Cashfree reported that this transfer failed.");
-      } else {
-        setToast("Your payout is still awaiting confirmation.");
-      }
+      const data = await api(`/api/payouts/${encodeURIComponent(result.transferId)}/status`);
+      setResult((r) => ({ ...r, ...data }));
     } catch (e) {
       setError(e.message);
-    } finally {
-      setBusy(false);
     }
   }
 
-  const payoutSuccess = payout?.status === "SUCCESS";
-  const payoutPending = payout?.status === "PENDING";
-  const payoutFailed = payout?.status === "FAILED";
+  // While the bank hasn't confirmed, check automatically (about 1 minute).
+  useEffect(() => {
+    if (stage !== "result" || result?.status !== "PENDING") return;
+    const t = setInterval(() => {
+      polls.current += 1;
+      if (polls.current > 15) return clearInterval(t);
+      checkStatus();
+    }, 4000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage, result?.status, result?.transferId]);
+
+  function startOver() {
+    window.history.replaceState({}, "", window.location.pathname);
+    setCode("");
+    setName("");
+    setPhone("");
+    setUpi("");
+    setResult(null);
+    setError("");
+    setStage("code");
+  }
+
+  const stepIndex = stage === "code" ? 0 : stage === "form" ? 1 : 2;
 
   return (
-    <div className="app-shell">
-      {/* HEADER */}
-      <header className="topbar">
-        <a className="brand" href="#top">
-          <span className="brand-mark">✦</span>
-
-          <span>
-            LUCKY<span className="brand-light">DROP</span>
-          </span>
-        </a>
-
-        <div className="top-right">
-          <span className="secure">
-            <ShieldCheck size={14} />
-            Secure rewards
-          </span>
-
-          <span className="demo-pill">SANDBOX SETUP</span>
+    <div className="page">
+      {demo && (
+        <div className="demo-bar" role="status">
+          Demo mode — no real money is sent.
         </div>
+      )}
+
+      <header className="top">
+        <span className="wordmark">
+          <Cap tone="red">
+            <span className="mini">★</span>
+          </Cap>
+          Cap&nbsp;Cashback
+        </span>
       </header>
 
-      <main id="top" className="main-grid">
-        {/* HERO SECTION */}
-        <section className="hero-panel">
-          <div className="eyebrow">
-            <span></span>A LITTLE SURPRISE, JUST FOR YOU
-          </div>
-
+      <main className="layout">
+        <section className="intro">
           <h1>
-            Scratch.
+            Look under the cap.
             <br />
-            <em>Reveal.</em> Enjoy.
+            Scan. Get paid.
           </h1>
-
-          <p className="hero-copy">
-            Your next little win is one scratch away. Reveal your reward and
-            request cashback directly to your UPI ID.
+          <p className="lede">
+            Every bottle cap hides a coupon with a QR code. Scan it, tell us where to send the money, and ₹5 to ₹100
+            lands in your UPI account.
           </p>
-
-          <div className="hero-perks">
-            <div>
-              <Sparkles size={16} />
-              <span>Instant reveal</span>
-            </div>
-
-            <div>
-              <ShieldCheck size={16} />
-              <span>One-time reward</span>
-            </div>
-          </div>
-
-          <div className="hero-note">
-            <Gift size={17} />
-            <span>Every card is a chance to get something back.</span>
-          </div>
+          <ul className="how">
+            <li>
+              <QrCode size={18} /> Scan the QR code under the cap, or type the 8-character code.
+            </li>
+            <li>
+              <Smartphone size={18} /> Enter your name, mobile number and UPI ID.
+            </li>
+            <li>
+              <BadgeIndianRupee size={18} /> Your cashback is sent straight to your UPI ID.
+            </li>
+          </ul>
         </section>
 
-        {/* SCRATCH CARD SECTION */}
-        <section className="play-column">
-          <div className="section-head">
-            <div>
-              <div className="eyebrow muted">YOUR REWARD</div>
+        <section className="panel" aria-live="polite">
+          <Steps current={stepIndex} />
 
-              <h2>Scratch card</h2>
-            </div>
+          {stage === "code" && (
+            <form
+              className="card"
+              onSubmit={(e) => {
+                e.preventDefault();
+                verify();
+              }}
+            >
+              <h2>Enter the code under your cap</h2>
+              <p className="help">Scanned the QR code? It fills in automatically. If you can't scan, type the code instead.</p>
 
-            <span className="step-count">
-              01 <i>/</i> 03
-            </span>
-          </div>
+              <label htmlFor="code">Coupon code</label>
+              <input
+                id="code"
+                className="code-input"
+                value={prettyCode(code)}
+                onChange={(e) => setCode(cleanCode(e.target.value))}
+                placeholder="XXXX-XXXX"
+                autoComplete="off"
+                autoCapitalize="characters"
+                spellCheck={false}
+                inputMode="text"
+              />
 
-          {!activePhone ? (
-            <div className="phone-card">
-              <div className="phone-icon">
-                <Smartphone size={22} />
+              <button className="btn" type="submit" disabled={busy}>
+                {busy ? <LoaderCircle size={18} className="spin" /> : null}
+                {busy ? "Checking code…" : "Check code"}
+              </button>
+              {error && <p className="error" role="alert"><CircleAlert size={16} />{error}</p>}
+            </form>
+          )}
+
+          {stage === "form" && (
+            <form className="card" onSubmit={redeem} noValidate>
+              <div className="valid-chip">
+                <CheckCircle2 size={16} /> Code {prettyCode(code)} is valid
               </div>
+              <h2>Where should we send your cashback?</h2>
 
-              <h3>Where should we send your reward?</h3>
+              <label htmlFor="name">Full name</label>
+              <input id="name" value={name} onChange={(e) => setName(e.target.value)} autoComplete="name" maxLength={60} placeholder="As on your bank account" />
 
-              <p>
-                Enter your mobile number to create your personal reward account.
-              </p>
-
-              <label htmlFor="phone">MOBILE NUMBER</label>
-
-              <div className="phone-input">
+              <label htmlFor="phone">Registered mobile number</label>
+              <div className="phone-row">
                 <span>+91</span>
-
                 <input
                   id="phone"
                   value={phone}
-                  onChange={(e) =>
-                    setPhone(e.target.value.replace(/\D/g, "").slice(0, 10))
-                  }
-                  placeholder="10-digit mobile number"
+                  onChange={(e) => setPhone(e.target.value.replace(/\D/g, "").slice(0, 10))}
                   inputMode="numeric"
-                  maxLength={10}
+                  autoComplete="tel-national"
+                  placeholder="10-digit number"
                 />
               </div>
 
-              <button className="primary-btn" onClick={start} disabled={busy}>
-                {busy ? "Please wait…" : "Continue to scratch"}
+              <label htmlFor="upi">UPI ID</label>
+              <input
+                id="upi"
+                value={upi}
+                onChange={(e) => setUpi(e.target.value.trim())}
+                autoComplete="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                placeholder="name@bank"
+              />
+              <p className="help small">Check your UPI ID carefully. UPI payments can't be reversed.</p>
 
-                <ArrowUpRight size={17} />
+              <button className="btn" type="submit" disabled={busy}>
+                {busy ? <LoaderCircle size={18} className="spin" /> : null}
+                {busy ? "Sending cashback…" : "Get my cashback"}
               </button>
+              {error && <p className="error" role="alert"><CircleAlert size={16} />{error}</p>}
+              <button type="button" className="link" onClick={startOver}>
+                Use a different code
+              </button>
+            </form>
+          )}
 
-              {error && <div className="error-msg">{error}</div>}
-            </div>
-          ) : (
-            <>
-              <div className="reward-card">
-                <div className="reward-card-top">
-                  <span>LUCKY DROP</span>
-                  <span className="reward-star">✦</span>
-                </div>
-
-                <div className="reward-center">
-                  <div className="reward-orbit">✦</div>
-
-                  <div className="reward-title">
-                    A reward
-                    <br />
-                    is waiting
-                  </div>
-
-                  <p>Made for you. Just scratch to reveal.</p>
-                </div>
-
-                <div className="reward-card-bottom">
-                  <span>ONE CARD · ONE REWARD</span>
-                  <span>✦ ✦ ✦</span>
-                </div>
-              </div>
-
-              {!prize ? (
-                <ScratchSurface onReveal={reveal} disabled={busy} />
-              ) : (
-                <div className="win-panel">
-                  <div className="win-icon">
-                    <CheckCircle2 size={26} />
-                  </div>
-
-                  <div className="eyebrow muted">YOU JUST WON</div>
-
-                  <div className="win-amount">{money(prize)}</div>
-
-                  <p>
-                    Your prize is revealed. Submit your UPI ID to request
-                    cashback.
+          {stage === "result" && result && (
+            <div className="card result">
+              {result.status === "SUCCESS" && (
+                <>
+                  <Cap tone="gold" spin>
+                    <span className="cap-amount">{money(result.amount)}</span>
+                  </Cap>
+                  <h2>{result.demo ? "Demo cashback complete" : "Cashback sent"}</h2>
+                  <p className="help">
+                    {result.demo
+                      ? `${money(result.amount)} would be sent to ${upi}. No real money moved because the server is in demo mode.`
+                      : `${money(result.amount)} is on its way to ${upi}. It should show in your UPI app within moments.`}
                   </p>
-
-                  {/* UPI ENTRY FORM */}
-                  {!payout && (
-                    <form className="upi-form" onSubmit={requestPayout}>
-                      <label htmlFor="upiId">YOUR UPI ID</label>
-
-                      <div className="phone-input">
-                        <Banknote size={17} />
-
-                        <input
-                          id="upiId"
-                          value={upiId}
-                          onChange={(e) => setUpiId(e.target.value)}
-                          placeholder="name@bank"
-                          autoComplete="off"
-                          maxLength={100}
-                        />
-                      </div>
-
-                      <button
-                        className="primary-btn"
-                        type="submit"
-                        disabled={busy}
-                      >
-                        {busy ? "Please wait…" : "Request UPI cashback"}
-
-                        {busy ? (
-                          <LoaderCircle size={17} className="spin" />
-                        ) : (
-                          <ArrowUpRight size={17} />
-                        )}
-                      </button>
-
-                      <p className="upi-note">
-                        Your UPI ID is used only to process this reward request.
-                      </p>
-                    </form>
-                  )}
-
-                  {/* PENDING STATUS */}
-                  {payoutPending && (
-                    <div className="payout-status pending">
-                      <LoaderCircle size={18} className="spin" />
-
-                      <div>
-                        <strong>Payment processing</strong>
-
-                        <p>{payout.message}</p>
-
-                        <button
-                          className="secondary-btn"
-                          type="button"
-                          onClick={checkPayoutStatus}
-                          disabled={busy}
-                        >
-                          Check payment status
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* SUCCESS STATUS */}
-                  {payoutSuccess && (
-                    <div className="payout-status success">
-                      <CheckCircle2 size={18} />
-
-                      <div>
-                        <strong>Cashback payment confirmed</strong>
-
-                        <p>{payout.message}</p>
-
-                        {payout.utr && <p>UTR: {payout.utr}</p>}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* FAILED STATUS */}
-                  {payoutFailed && (
-                    <div className="payout-status failed">
-                      <CircleHelp size={18} />
-
-                      <div>
-                        <strong>Payment failed</strong>
-
-                        <p>{payout.message}</p>
-
-                        <p>
-                          Please contact support before requesting another
-                          transfer.
-                        </p>
-                      </div>
-                    </div>
-                  )}
-
-                  <button
-                    className="secondary-btn"
-                    onClick={start}
-                    disabled={busy}
-                  >
-                    <RotateCcw size={16} />
-                    Try another card
-                  </button>
-                </div>
+                  {result.utr && !result.demo && <p className="utr">Bank reference (UTR): {result.utr}</p>}
+                </>
               )}
 
-              {error && <div className="error-msg">{error}</div>}
+              {result.status === "PENDING" && (
+                <>
+                  <Cap tone="steel">
+                    <LoaderCircle size={34} className="spin" />
+                  </Cap>
+                  <h2>Sending {money(result.amount)}…</h2>
+                  <p className="help">Waiting for the bank to confirm. This page updates by itself. Please don't submit the code again.</p>
+                  <button className="btn ghost" onClick={checkStatus}>Check now</button>
+                </>
+              )}
 
-              <div className="card-footnote">
-                <ShieldCheck size={14} />
-                Each card can be claimed only once.
-              </div>
-            </>
+              {(result.status === "FAILED" || result.status === "REJECTED") && (
+                <>
+                  <h2>Transfer didn't go through</h2>
+                  <p className="help">
+                    The bank couldn't complete this payment. Contact support and quote your code <strong>{prettyCode(code)}</strong> —
+                    don't try to use it again.
+                  </p>
+                </>
+              )}
+
+              {error && <p className="error" role="alert"><CircleAlert size={16} />{error}</p>}
+              <button className="link" onClick={startOver}>Redeem another cap</button>
+            </div>
           )}
+
+          <p className="foot">
+            <ShieldCheck size={14} /> Each code works once. Your details are used only to send this cashback.
+          </p>
         </section>
-
-        {/* WALLET SECTION */}
-        <aside className="wallet-column">
-          <div className="wallet-head">
-            <div className="wallet-icon">
-              <Wallet size={19} />
-            </div>
-
-            <div>
-              <div className="eyebrow muted">YOUR ACCOUNT</div>
-
-              <h2>Cashback wallet</h2>
-            </div>
-          </div>
-
-          <div className="balance-card">
-            <div className="balance-label">
-              CONFIRMED CASHBACK
-              <span className="live-dot"></span>
-            </div>
-
-            <div className="balance-value">{money(wallet.balance)}</div>
-
-            <div className="balance-foot">
-              <span>INR WALLET</span>
-              <span>Confirmed payments only</span>
-            </div>
-          </div>
-
-          <div className="wallet-info">
-            <div className="info-icon">
-              <ShieldCheck size={17} />
-            </div>
-
-            <div>
-              <strong>Verified payment credit</strong>
-
-              <p>
-                Wallet history updates only after the payment provider confirms
-                a successful transfer.
-              </p>
-            </div>
-          </div>
-
-          <div className="history-head">
-            <h3>
-              <History size={16} />
-              Recent activity
-            </h3>
-
-            <span>{wallet.history?.length || 0}</span>
-          </div>
-
-          {!wallet.history?.length ? (
-            <div className="empty-history">
-              <div className="empty-icon">
-                <Gift size={20} />
-              </div>
-
-              <strong>No confirmed rewards yet</strong>
-
-              <p>Your successful cashback payments will appear here.</p>
-            </div>
-          ) : (
-            <div className="history-list">
-              {wallet.history.map((item) => (
-                <div className="history-item" key={item.id}>
-                  <div className="history-gift">
-                    <Gift size={16} />
-                  </div>
-
-                  <div className="history-desc">
-                    <strong>Scratch reward</strong>
-
-                    <span>
-                      {new Date(item.created_at + "Z").toLocaleString("en-IN")}
-                    </span>
-                  </div>
-
-                  <strong className="history-amount">
-                    +{money(item.amount)}
-                  </strong>
-                </div>
-              ))}
-            </div>
-          )}
-
-          <div className="wallet-disclaimer">
-            <CircleHelp size={14} />
-            Cashfree payouts are currently disabled while sandbox authentication
-            and transfer testing are completed.
-          </div>
-        </aside>
       </main>
-
-      {/* FOOTER */}
-      <footer>
-        <span>© 2026 LUCKYDROP REWARDS</span>
-        <span>Secure · Simple · Surprising</span>
-      </footer>
-
-      {toast && prize !== null && (
-        <div className="toast">
-          <CheckCircle2 size={16} />
-          {toast}
-        </div>
-      )}
     </div>
   );
 }

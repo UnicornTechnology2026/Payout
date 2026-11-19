@@ -14,35 +14,32 @@ const db = new Database(path.join(__dirname, "data.sqlite"));
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 
-// DATABASE TABLES
+const couponCount = (() => {
+  try {
+    return db.prepare("SELECT COUNT(*) AS n FROM coupons").get().n;
+  } catch {
+    return 0;
+  }
+})();
+console.log(`Database: ${path.join(__dirname, "data.sqlite")}`);
+console.log(`Coupons in database: ${couponCount}`);
+
+// coupons : one row per bottle cap (code + prize generated in advance)
+// payouts : one row per redemption. Unique on coupon_code => one payout max.
 db.exec(`
-  CREATE TABLE IF NOT EXISTS cards (
-    id TEXT PRIMARY KEY,
+  CREATE TABLE IF NOT EXISTS coupons (
+    code TEXT PRIMARY KEY,
     prize_paise INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'ready',
-    claimed_by TEXT,
+    batch TEXT,
+    status TEXT NOT NULL DEFAULT 'unused',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    claimed_at TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS wallets (
-    phone TEXT PRIMARY KEY,
-    balance_paise INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS ledger (
-    id TEXT PRIMARY KEY,
-    phone TEXT NOT NULL,
-    card_id TEXT NOT NULL UNIQUE,
-    amount_paise INTEGER NOT NULL,
-    type TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    redeemed_at TEXT
   );
 
   CREATE TABLE IF NOT EXISTS payouts (
     transfer_id TEXT PRIMARY KEY,
-    card_id TEXT NOT NULL UNIQUE,
+    coupon_code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
     phone TEXT NOT NULL,
     vpa TEXT NOT NULL,
     amount_paise INTEGER NOT NULL,
@@ -54,34 +51,74 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE INDEX IF NOT EXISTS idx_payouts_phone ON payouts(phone, created_at);
 `);
 
-// EXPRESS APP
 const app = express();
 
-app.use(
-  cors({
-    origin: process.env.CLIENT_ORIGIN || "http://localhost:5173",
-  }),
-);
+if (process.env.TRUST_PROXY)
+  app.set("trust proxy", Number(process.env.TRUST_PROXY));
 
+app.use(cors({ origin: process.env.CLIENT_ORIGIN || "http://localhost:5173" }));
 app.use(express.json({ limit: "20kb" }));
 
-// PRIZE AMOUNTS IN PAISE
-const prizes = [500, 500, 1000, 2000, 5000];
-
-const validPhone = (phone) => /^\d{10}$/.test(String(phone || ""));
-
-const validVpa = (vpa) =>
+// ---------------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------------
+const validPhone = (v) => /^[6-9]\d{9}$/.test(String(v || ""));
+const validVpa = (v) =>
   /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}@[A-Za-z0-9.-]{2,50}$/.test(
-    String(vpa || ""),
+    String(v || ""),
   );
+const validName = (v) =>
+  /^[\p{L}][\p{L} .'-]{1,59}$/u.test(String(v || "").trim());
+
+// Codes: 8 chars from an alphabet without look-alikes (no 0/O/1/I/L).
+const normalizeCode = (v) =>
+  String(v || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+const validCode = (v) => /^[A-HJ-KM-NP-Z2-9]{8}$/.test(v);
 
 const rupees = (paise) => Number((paise / 100).toFixed(2));
-
 const payoutsEnabled = () => process.env.ENABLE_CASHFREE_PAYOUTS === "true";
+const demoMode = () => !payoutsEnabled();
+const maxPerPhonePerDay = () =>
+  Number(process.env.MAX_REDEMPTIONS_PER_PHONE_PER_DAY || 5);
 
-// CASHFREE CONFIGURATION
+// Tiny in-memory rate limiter (per IP).
+function rateLimit({ windowMs, max }) {
+  const hits = new Map();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of hits) if (v.reset < now) hits.delete(k);
+  }, windowMs).unref();
+
+  return (req, res, next) => {
+    const key = req.ip;
+    const now = Date.now();
+    const entry = hits.get(key);
+    if (!entry || entry.reset < now) {
+      hits.set(key, { count: 1, reset: now + windowMs });
+      return next();
+    }
+    entry.count += 1;
+    if (entry.count > max) {
+      return res.status(429).json({
+        error: "Too many attempts. Please wait a minute and try again.",
+      });
+    }
+    next();
+  };
+}
+
+const lookupLimiter = rateLimit({ windowMs: 60_000, max: 30 });
+const redeemLimiter = rateLimit({ windowMs: 60_000, max: 8 });
+
+// ---------------------------------------------------------------------------
+// CASHFREE
+// ---------------------------------------------------------------------------
 function cashfreeBaseUrl() {
   return process.env.CASHFREE_ENV === "production"
     ? "https://api.cashfree.com/payout"
@@ -101,9 +138,7 @@ function cashfreeHeaders() {
     path.resolve(__dirname, publicKeyPath),
     "utf8",
   );
-
   const timestamp = Math.floor(Date.now() / 1000);
-  const message = `${clientId}.${timestamp}`;
 
   const signature = publicEncrypt(
     {
@@ -111,7 +146,7 @@ function cashfreeHeaders() {
       padding: constants.RSA_PKCS1_OAEP_PADDING,
       oaepHash: "sha1",
     },
-    Buffer.from(message, "utf8"),
+    Buffer.from(`${clientId}.${timestamp}`, "utf8"),
   ).toString("base64");
 
   return {
@@ -123,21 +158,15 @@ function cashfreeHeaders() {
   };
 }
 
-// CASHFREE API REQUEST
 async function cashfreeRequest(endpoint, options = {}) {
   const response = await fetch(`${cashfreeBaseUrl()}${endpoint}`, {
     ...options,
-    headers: {
-      ...cashfreeHeaders(),
-      ...(options.headers || {}),
-    },
+    headers: { ...cashfreeHeaders(), ...(options.headers || {}) },
     signal: AbortSignal.timeout(15000),
   });
 
   const raw = await response.text();
-
   let data;
-
   try {
     data = raw ? JSON.parse(raw) : {};
   } catch {
@@ -150,58 +179,38 @@ async function cashfreeRequest(endpoint, options = {}) {
         data.error ||
         `Cashfree returned HTTP ${response.status}.`,
     );
-
     error.status = response.status;
     error.providerData = data;
-
     throw error;
   }
-
   return data;
 }
 
-// SAVE CASHFREE TRANSFER STATUS
+// Persist a provider (or demo) status. A SUCCESS is never downgraded.
 function saveProviderResponse(transferId, data) {
   const status = String(
     data.status || data.transfer_status || "PENDING",
   ).toUpperCase();
+  const success = status === "SUCCESS";
+  const failure = ["FAILED", "REJECTED", "CANCELLED"].includes(status);
 
-  const terminalSuccess = status === "SUCCESS";
-
-  const terminalFailure = ["FAILED", "REJECTED", "CANCELLED"].includes(status);
-
-  const update = db.transaction(() => {
+  return db.transaction(() => {
     const payout = db
       .prepare("SELECT * FROM payouts WHERE transfer_id = ?")
       .get(transferId);
-
     if (!payout) return null;
+    if (payout.status === "SUCCESS") return payout;
 
-    // Never downgrade a completed payout.
-    if (payout.status === "SUCCESS") {
-      return payout;
-    }
-
-    const nextStatus = terminalSuccess
-      ? "SUCCESS"
-      : terminalFailure
-        ? "FAILED"
-        : "PENDING";
+    const next = success ? "SUCCESS" : failure ? "FAILED" : "PENDING";
 
     db.prepare(
-      `
-      UPDATE payouts
-      SET
-        status = ?,
-        provider_status = ?,
-        cf_transfer_id = COALESCE(?, cf_transfer_id),
-        transfer_utr = COALESCE(?, transfer_utr),
-        provider_response = ?,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE transfer_id = ?
-    `,
+      `UPDATE payouts SET status = ?, provider_status = ?,
+         cf_transfer_id = COALESCE(?, cf_transfer_id),
+         transfer_utr = COALESCE(?, transfer_utr),
+         provider_response = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE transfer_id = ?`,
     ).run(
-      nextStatus,
+      next,
       status,
       data.cf_transfer_id || null,
       data.transfer_utr || null,
@@ -209,395 +218,148 @@ function saveProviderResponse(transferId, data) {
       transferId,
     );
 
-    if (terminalSuccess) {
-      db.prepare(
-        `
-        UPDATE cards
-        SET
-          status = 'paid',
-          claimed_by = ?,
-          claimed_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-          AND status IN (
-            'revealed',
-            'payout_pending',
-            'payout_failed'
-          )
-      `,
-      ).run(payout.phone, payout.card_id);
-
-      // Add ledger record only once.
-      const ledgerInsert = db
-        .prepare(
-          `
-        INSERT OR IGNORE INTO ledger (
-          id,
-          phone,
-          card_id,
-          amount_paise,
-          type
-        )
-        VALUES (?, ?, ?, ?, 'UPI_CASHBACK')
-      `,
-        )
-        .run(
-          `CF-${transferId}`,
-          payout.phone,
-          payout.card_id,
-          payout.amount_paise,
-        );
-
-      // Credit wallet only after confirmed SUCCESS.
-      if (ledgerInsert.changes > 0) {
-        db.prepare(
-          `
-          INSERT INTO wallets (
-            phone,
-            balance_paise
-          )
-          VALUES (?, ?)
-
-          ON CONFLICT(phone) DO UPDATE
-          SET
-            balance_paise =
-              balance_paise + excluded.balance_paise,
-            updated_at = CURRENT_TIMESTAMP
-        `,
-        ).run(payout.phone, payout.amount_paise);
-      }
-    } else if (terminalFailure) {
-      db.prepare(
-        `
-        UPDATE cards
-        SET status = 'payout_failed'
-        WHERE id = ?
-          AND status != 'paid'
-      `,
-      ).run(payout.card_id);
-    } else {
-      db.prepare(
-        `
-        UPDATE cards
-        SET status = 'payout_pending'
-        WHERE id = ?
-          AND status != 'paid'
-      `,
-      ).run(payout.card_id);
-    }
+    const couponStatus = success
+      ? "paid"
+      : failure
+        ? "payout_failed"
+        : "payout_pending";
+    db.prepare(
+      "UPDATE coupons SET status = ? WHERE code = ? AND status != 'paid'",
+    ).run(couponStatus, payout.coupon_code);
 
     return db
       .prepare("SELECT * FROM payouts WHERE transfer_id = ?")
       .get(transferId);
-  });
-
-  return update();
+  })();
 }
 
-// CASHFREE AUTHENTICATION TEST — DOES NOT CREATE A PAYOUT
-app.get("/api/cashfree/auth-test", async (_req, res) => {
-  try {
-    const testTransferId = `AUTH_TEST_${Date.now()}`;
-
-    const query = new URLSearchParams({
-      transfer_id: testTransferId,
-    });
-
-    await cashfreeRequest(`/transfers?${query.toString()}`, {
-      method: "GET",
-    });
-
-    return res.json({
-      ok: true,
-      message: "Cashfree authentication successful.",
-    });
-  } catch (error) {
-    const provider = error.providerData || {};
-
-    // An unknown transfer ID can return 404 even when authentication works.
-    if (error.status === 404) {
-      return res.json({
-        ok: true,
-        message:
-          "Cashfree authentication appears successful. Test transfer ID was not found, as expected.",
-      });
-    }
-
-    console.error("Cashfree authentication test:", error.message);
-
-    return res.status(error.status || 500).json({
-      ok: false,
-      message: "Cashfree authentication test failed.",
-      providerMessage: provider.message || provider.error || error.message,
-    });
-  }
-});
-
-// HEALTH CHECK
+// ---------------------------------------------------------------------------
+// ROUTES
+// ---------------------------------------------------------------------------
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     mode: payoutsEnabled() ? "CASHFREE_PAYOUTS" : "DEMO_ONLY",
-    cashfreeEnabled: payoutsEnabled(),
   });
 });
 
-// CREATE SCRATCH CARD
-app.post("/api/cards/new", (req, res) => {
-  const { phone } = req.body || {};
-
-  if (!validPhone(phone)) {
-    return res.status(400).json({
-      error: "Enter a valid 10-digit mobile number.",
-    });
-  }
-
-  const id = `SC-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
-
-  const prize = prizes[crypto.randomInt(prizes.length)];
-
-  db.prepare(
-    `
-    INSERT INTO cards (id, prize_paise)
-    VALUES (?, ?)
-  `,
-  ).run(id, prize);
-
-  res.json({
-    cardId: id,
-    message: "Your scratch card is ready.",
-  });
+app.get("/api/config", (_req, res) => {
+  res.json({ demo: demoMode() });
 });
 
-// GET WALLET
-app.get("/api/wallet/:phone", (req, res) => {
-  const phone = req.params.phone;
+// Step 1 — is the code real and unused? (does NOT reveal the prize)
+app.get("/api/coupons/:code", lookupLimiter, (req, res) => {
+  const code = normalizeCode(req.params.code);
 
-  if (!validPhone(phone)) {
+  if (!validCode(code)) {
     return res.status(400).json({
-      error: "Invalid mobile number.",
+      valid: false,
+      error:
+        "That code doesn't look right. Check the 8 characters under the cap.",
     });
   }
 
-  const wallet = db
-    .prepare(
-      `
-    SELECT balance_paise
-    FROM wallets
-    WHERE phone = ?
-  `,
-    )
-    .get(phone);
+  const coupon = db
+    .prepare("SELECT code, status FROM coupons WHERE code = ?")
+    .get(code);
 
-  const history = db
-    .prepare(
-      `
-    SELECT
-      id,
-      card_id,
-      amount_paise,
-      type,
-      created_at
-    FROM ledger
-    WHERE phone = ?
-    ORDER BY created_at DESC
-    LIMIT 20
-  `,
-    )
-    .all(phone);
-
-  res.json({
-    phone,
-    balance: rupees(wallet?.balance_paise || 0),
-    currency: "INR",
-    history: history.map((item) => ({
-      ...item,
-      amount: rupees(item.amount_paise),
-    })),
-  });
-});
-
-// REVEAL PRIZE
-// This endpoint does NOT credit the wallet.
-app.post("/api/cards/:id/reveal", (req, res) => {
-  const phone = String(req.body?.phone || "");
-
-  if (!validPhone(phone)) {
-    return res.status(400).json({
-      error: "Enter a valid 10-digit mobile number.",
-    });
-  }
-
-  const card = db
-    .prepare(
-      `
-    SELECT *
-    FROM cards
-    WHERE id = ?
-  `,
-    )
-    .get(req.params.id);
-
-  if (!card) {
+  if (!coupon) {
     return res.status(404).json({
-      error: "Scratch card not found.",
+      valid: false,
+      error: "We couldn't find this code. Check it and try again.",
     });
   }
 
-  if (card.status === "paid") {
+  if (coupon.status !== "unused") {
     return res.status(409).json({
-      error: "This scratch card has already been paid.",
+      valid: false,
+      status: coupon.status,
+      error:
+        coupon.status === "paid"
+          ? "This code has already been redeemed."
+          : "This code is already being processed.",
     });
   }
 
-  if (card.claimed_by && card.claimed_by !== phone) {
-    return res.status(409).json({
-      error: "This scratch card is already linked to another mobile number.",
-    });
-  }
-
-  if (card.status === "ready") {
-    db.prepare(
-      `
-      UPDATE cards
-      SET
-        status = 'revealed',
-        claimed_by = ?
-      WHERE id = ?
-        AND status = 'ready'
-    `,
-    ).run(phone, card.id);
-  }
-
-  res.json({
-    prize: rupees(card.prize_paise),
-    amountPaise: card.prize_paise,
-    status: card.status === "ready" ? "revealed" : card.status,
-    message: "Prize revealed. Submit your UPI ID to request cashback.",
-  });
+  res.json({ valid: true, code });
 });
 
-// INITIATE UPI PAYOUT
-app.post("/api/payouts/upi", async (req, res) => {
-  if (!payoutsEnabled()) {
-    return res.status(501).json({
-      error: "Cashfree payouts are disabled. This server is in demo-only mode.",
-    });
-  }
-
+// Step 2 — claim the coupon and start the cashback transfer.
+app.post("/api/redeem", redeemLimiter, async (req, res) => {
+  const code = normalizeCode(req.body?.code);
+  const name = String(req.body?.name || "").trim();
   const phone = String(req.body?.phone || "");
-  const cardId = String(req.body?.cardId || "");
   const vpa = String(req.body?.upiId || "").trim();
 
-  if (!validPhone(phone)) {
-    return res.status(400).json({
-      error: "Enter a valid 10-digit mobile number.",
-    });
-  }
+  if (!validCode(code))
+    return res.status(400).json({ error: "Enter a valid coupon code." });
+  if (!validName(name))
+    return res.status(400).json({ error: "Enter your full name." });
+  if (!validPhone(phone))
+    return res
+      .status(400)
+      .json({ error: "Enter a valid 10-digit mobile number." });
+  if (!validVpa(vpa))
+    return res
+      .status(400)
+      .json({ error: "Enter a valid UPI ID, for example name@upi." });
 
-  if (!/^SC-[A-F0-9]{10}$/.test(cardId)) {
-    return res.status(400).json({
-      error: "Invalid scratch card ID.",
-    });
-  }
-
-  if (!validVpa(vpa)) {
-    return res.status(400).json({
-      error: "Enter a valid UPI ID, for example name@upi.",
-    });
-  }
-
-  const card = db
+  const todayCount = db
     .prepare(
-      `
-    SELECT *
-    FROM cards
-    WHERE id = ?
-  `,
+      "SELECT COUNT(*) AS n FROM payouts WHERE phone = ? AND created_at >= datetime('now','-1 day')",
     )
-    .get(cardId);
+    .get(phone).n;
 
-  if (!card) {
-    return res.status(404).json({
-      error: "Scratch card not found.",
+  if (todayCount >= maxPerPhonePerDay()) {
+    return res.status(429).json({
+      error: `This mobile number has reached today's limit of ${maxPerPhonePerDay()} redemptions. Try again tomorrow.`,
     });
   }
 
-  if (card.claimed_by !== phone) {
-    return res.status(403).json({
-      error: "This card does not belong to this mobile number.",
+  const transferId = `CB${crypto.randomBytes(12).toString("hex").toUpperCase()}`;
+
+  // Atomic claim: only one request can flip unused -> payout_pending.
+  const claim = db.transaction(() => {
+    const coupon = db.prepare("SELECT * FROM coupons WHERE code = ?").get(code);
+    if (!coupon) return { error: "We couldn't find this code.", status: 404 };
+
+    const updated = db
+      .prepare(
+        "UPDATE coupons SET status = 'payout_pending', redeemed_at = CURRENT_TIMESTAMP WHERE code = ? AND status = 'unused'",
+      )
+      .run(code);
+
+    if (updated.changes === 0)
+      return { error: "This code has already been used.", status: 409 };
+
+    db.prepare(
+      `INSERT INTO payouts (transfer_id, coupon_code, name, phone, vpa, amount_paise, status)
+       VALUES (?, ?, ?, ?, ?, ?, 'PENDING')`,
+    ).run(transferId, code, name, phone, vpa, coupon.prize_paise);
+
+    return { coupon };
+  })();
+
+  if (claim.error) return res.status(claim.status).json({ error: claim.error });
+
+  const amount = rupees(claim.coupon.prize_paise);
+
+  // DEMO MODE — no money moves.
+  if (demoMode()) {
+    saveProviderResponse(transferId, {
+      status: "SUCCESS",
+      transfer_utr: `DEMO${Date.now()}`,
+    });
+    return res.json({
+      status: "SUCCESS",
+      demo: true,
+      transferId,
+      amount,
+      message: "Demo mode: no real money was sent.",
     });
   }
 
-  if (!["revealed", "payout_pending", "payout_failed"].includes(card.status)) {
-    return res.status(409).json({
-      error: "This card is not available for payout.",
-    });
-  }
-
-  // Prevent duplicate payout for the same card.
-  const existing = db
-    .prepare(
-      `
-    SELECT *
-    FROM payouts
-    WHERE card_id = ?
-  `,
-    )
-    .get(cardId);
-
-  if (existing) {
-    if (existing.status === "SUCCESS") {
-      return res.json({
-        status: "SUCCESS",
-        transferId: existing.transfer_id,
-        message: "Cashback was already paid for this card.",
-      });
-    }
-
-    if (existing.status === "PENDING") {
-      return res.status(202).json({
-        status: "PENDING",
-        transferId: existing.transfer_id,
-        message:
-          "This payout is already being processed. Check its status; do not submit it again.",
-      });
-    }
-
-    return res.status(409).json({
-      status: existing.status,
-      transferId: existing.transfer_id,
-      message:
-        "A payout request already exists for this card. Contact support before retrying a failed transfer.",
-    });
-  }
-
-  const transferId = `SC${crypto.randomBytes(12).toString("hex").toUpperCase()}`;
-
-  const amount = rupees(card.prize_paise);
-
-  // Save payout record before calling Cashfree.
-  db.prepare(
-    `
-    INSERT INTO payouts (
-      transfer_id,
-      card_id,
-      phone,
-      vpa,
-      amount_paise,
-      status
-    )
-    VALUES (?, ?, ?, ?, ?, 'PENDING')
-  `,
-  ).run(transferId, cardId, phone, vpa, card.prize_paise);
-
-  db.prepare(
-    `
-    UPDATE cards
-    SET status = 'payout_pending'
-    WHERE id = ?
-  `,
-  ).run(cardId);
-
+  // LIVE MODE — call Cashfree.
   try {
     const providerData = await cashfreeRequest("/transfers", {
       method: "POST",
@@ -606,20 +368,12 @@ app.post("/api/payouts/upi", async (req, res) => {
         transfer_amount: amount,
         transfer_currency: "INR",
         transfer_mode: "upi",
-
         beneficiary_details: {
-          beneficiary_name: "Scratch Reward",
-
-          beneficiary_instrument_details: {
-            vpa,
-          },
-
-          beneficiary_contact_details: {
-            beneficiary_phone: phone,
-          },
+          beneficiary_name: name,
+          beneficiary_instrument_details: { vpa },
+          beneficiary_contact_details: { beneficiary_phone: phone },
         },
-
-        transfer_remarks: "Scratch cashback reward",
+        transfer_remarks: "Bottle cap cashback",
       }),
     });
 
@@ -628,121 +382,110 @@ app.post("/api/payouts/upi", async (req, res) => {
     return res.status(saved?.status === "SUCCESS" ? 200 : 202).json({
       status: saved?.status || "PENDING",
       transferId,
-      prize: amount,
+      amount,
+      utr: saved?.transfer_utr || null,
       message:
         saved?.status === "SUCCESS"
-          ? "Cashfree confirmed the cashback transfer."
-          : "Payout request accepted. The transfer is not yet confirmed; check its status.",
+          ? "Cashback sent to your UPI ID."
+          : "Your cashback is on its way. We're waiting for the bank to confirm.",
     });
   } catch (error) {
-    // A timeout does not prove that Cashfree rejected the transfer.
-    // Keep it pending and reconcile using the same transfer ID.
+    // A timeout doesn't prove Cashfree rejected it — keep PENDING, reconcile later.
     console.error("Cashfree payout initiation error:", error.message);
 
     db.prepare(
-      `
-      UPDATE payouts
-      SET
-        provider_status = ?,
-        provider_response = ?,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE transfer_id = ?
-    `,
+      `UPDATE payouts SET provider_status = ?, provider_response = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE transfer_id = ?`,
     ).run(
       `INITIATION_UNCERTAIN_${error.status || "NETWORK"}`,
-      JSON.stringify(
-        error.providerData || {
-          message: error.message,
-        },
-      ),
+      JSON.stringify(error.providerData || { message: error.message }),
       transferId,
     );
 
     return res.status(202).json({
       status: "PENDING",
       transferId,
+      amount,
       message:
-        "The payout request could not be confirmed yet. Please check status; do not submit another request.",
+        "Your cashback is being processed. Check status in a moment — don't submit again.",
     });
   }
 });
 
-// CHECK PAYOUT STATUS
-app.get("/api/payouts/:transferId/status", async (req, res) => {
+// Step 3 — poll payout status.
+app.get("/api/payouts/:transferId/status", lookupLimiter, async (req, res) => {
   const transferId = String(req.params.transferId || "");
-
   const payout = db
-    .prepare(
-      `
-    SELECT *
-    FROM payouts
-    WHERE transfer_id = ?
-  `,
-    )
+    .prepare("SELECT * FROM payouts WHERE transfer_id = ?")
     .get(transferId);
 
-  if (!payout) {
-    return res.status(404).json({
-      error: "Payout not found.",
-    });
-  }
+  if (!payout) return res.status(404).json({ error: "Payout not found." });
 
   if (payout.status !== "SUCCESS" && payoutsEnabled()) {
     try {
-      const query = new URLSearchParams({
-        transfer_id: transferId,
+      const query = new URLSearchParams({ transfer_id: transferId });
+      const providerData = await cashfreeRequest(`/transfers?${query}`, {
+        method: "GET",
       });
-
-      const providerData = await cashfreeRequest(
-        `/transfers?${query.toString()}`,
-        { method: "GET" },
-      );
-
       saveProviderResponse(transferId, providerData);
     } catch (error) {
       console.error("Cashfree payout status error:", error.message);
-
-      // Keep pending if status lookup fails.
     }
   }
 
   const latest = db
-    .prepare(
-      `
-    SELECT *
-    FROM payouts
-    WHERE transfer_id = ?
-  `,
-    )
+    .prepare("SELECT * FROM payouts WHERE transfer_id = ?")
     .get(transferId);
 
-  return res.json({
+  res.json({
     transferId: latest.transfer_id,
     status: latest.status,
     amount: rupees(latest.amount_paise),
     utr: latest.transfer_utr || null,
-
     message:
       latest.status === "SUCCESS"
-        ? "Cashfree confirmed the transfer."
+        ? "Cashback sent to your UPI ID."
         : latest.status === "FAILED"
-          ? "Cashfree reported that the transfer failed."
-          : "Transfer is still being processed or awaiting confirmation.",
+          ? "The transfer failed. Please contact support with your coupon code."
+          : "Still waiting for the bank to confirm.",
   });
 });
 
-// ERROR HANDLER
+// Cashfree auth check — does not create a payout.
+app.get("/api/cashfree/auth-test", async (_req, res) => {
+  try {
+    const query = new URLSearchParams({
+      transfer_id: `AUTH_TEST_${Date.now()}`,
+    });
+    await cashfreeRequest(`/transfers?${query}`, { method: "GET" });
+    return res.json({
+      ok: true,
+      message: "Cashfree authentication successful.",
+    });
+  } catch (error) {
+    if (error.status === 404) {
+      return res.json({
+        ok: true,
+        message: "Cashfree authentication appears successful.",
+      });
+    }
+    console.error("Cashfree authentication test:", error.message);
+    return res.status(error.status || 500).json({
+      ok: false,
+      message: "Cashfree authentication test failed.",
+      providerMessage: error.providerData?.message || error.message,
+    });
+  }
+});
+
 app.use((err, _req, res, _next) => {
   console.error(err);
-
-  res.status(500).json({
-    error: "Unexpected server error.",
-  });
+  res.status(500).json({ error: "Unexpected server error." });
 });
 
-// START SERVER
 const port = Number(process.env.PORT || 4000);
-
 app.listen(port, () => {
-  console.log(`Scratch cashback API running on http://localhost:${port}`);
+  console.log(
+    `Cashback API running on http://localhost:${port} (${demoMode() ? "DEMO" : "LIVE"} mode)`,
+  );
 });
